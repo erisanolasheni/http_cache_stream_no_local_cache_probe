@@ -75,6 +75,17 @@ class HttpCacheStream {
       await _validateCacheFuture!;
     }
     _checkDisposed();
+
+    // OFFLINE-FIRST: If headers are missing but a cache file exists on disk,
+    // reconstruct headers from the file so isCached can succeed without network.
+    if (_cacheMetadata.headers == null) {
+      final reconstructed = CachedResponseHeaders.fromFile(files.complete) ??
+          CachedResponseHeaders.fromFile(files.partial);
+      if (reconstructed != null) {
+        _setCachedResponseHeaders(reconstructed);
+      }
+    }
+
     final range = IntRange.validate(start, end, metadata.sourceLength);
 
     if (isCached) {
@@ -131,6 +142,19 @@ class HttpCacheStream {
         metadata.headers ?? CachedResponseHeaders.fromFile(cacheFile)!;
     if (!force && currentHeaders.shouldRevalidate() == false) return true;
 
+    // OFFLINE-FIRST: If revalidation is needed but a complete cache file
+    // exists locally, treat it as valid rather than making a network call.
+    // This ensures offline playback works for pre-cached content whose
+    // cache-control headers may have expired.
+    if (!force && cacheFile.existsSync()) {
+      final fileHeaders = CachedResponseHeaders.fromFile(cacheFile);
+      if (fileHeaders != null) {
+        _setCachedResponseHeaders(fileHeaders);
+        _calculateCacheProgress();
+        return true;
+      }
+    }
+
     return _validateCacheFuture = () async {
       try {
         final latestHeaders = await CachedResponseHeaders.fromUrl(
@@ -167,19 +191,33 @@ class HttpCacheStream {
     }
     _checkDisposed();
 
-    final responseHeaders = metadata.headers ??
-        await CachedResponseHeaders.fromUrl(
-          sourceUrl,
-          httpClient: config.httpClient,
-          requestHeaders: config.combinedRequestHeaders(),
-        ).then((headers) {
-          _setCachedResponseHeaders(headers);
-          return headers;
-        }).timeout(
-          config.requestTimeout,
-          onTimeout: () =>
-              throw StreamRequestTimedOutException(config.requestTimeout),
-        );
+    CachedResponseHeaders? responseHeaders = metadata.headers;
+
+    // OFFLINE-FIRST: If headers are not in memory, try to reconstruct them
+    // from the local cache file before falling back to a network HEAD request.
+    // This prevents offline playback failure for pre-cached content.
+    if (responseHeaders == null) {
+      final fromFile = CachedResponseHeaders.fromFile(files.complete) ??
+          CachedResponseHeaders.fromFile(files.partial);
+      if (fromFile != null) {
+        _setCachedResponseHeaders(fromFile);
+        responseHeaders = fromFile;
+      }
+    }
+
+    // Only fall back to network if we truly have no local data
+    responseHeaders ??= await CachedResponseHeaders.fromUrl(
+      sourceUrl,
+      httpClient: config.httpClient,
+      requestHeaders: config.combinedRequestHeaders(),
+    ).then((headers) {
+      _setCachedResponseHeaders(headers);
+      return headers;
+    }).timeout(
+      config.requestTimeout,
+      onTimeout: () =>
+          throw StreamRequestTimedOutException(config.requestTimeout),
+    );
 
     final range = IntRange.validate(start, end, responseHeaders.sourceLength);
     return HeaderStreamResponse(range, responseHeaders);
