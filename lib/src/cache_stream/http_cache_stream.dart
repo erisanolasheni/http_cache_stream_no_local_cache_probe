@@ -92,6 +92,22 @@ class HttpCacheStream {
       return StreamResponse.fromFile(range, files, metadata.headers!);
     }
 
+    // OFFLINE-FIRST: If we have a partial cache file and the requested range
+    // is fully within the cached bytes, serve directly from the partial file
+    // without triggering a network download. This enables offline playback
+    // of partially pre-cached content (e.g. HLS segments that were prefetched
+    // but not finalized, or progressive video cached up to a certain point).
+    if (metadata.headers != null) {
+      final cachedBytes = files.cacheFileSize() ?? 0;
+      if (cachedBytes > 0 && range.start < cachedBytes) {
+        // If end is null, serve the entire partial file (player reads until EOF).
+        // If end is specified, only serve if the range is fully within cached data.
+        if (range.end == null || range.end! <= cachedBytes) {
+          return StreamResponse.fromFile(range, files, metadata.headers!);
+        }
+      }
+    }
+
     final rangeThreshold = config.rangeRequestSplitThreshold;
     if (rangeThreshold != null &&
         range.start >= rangeThreshold &&
@@ -135,19 +151,29 @@ class HttpCacheStream {
       return _validateCacheFuture;
     }
     _checkDisposed();
-    if (isDownloading || !cacheFile.existsSync()) {
+
+    // OFFLINE-FIRST: Check both complete and partial cache files.
+    final activeFile = files.activeCacheFile();
+    final hasAnyCacheFile = activeFile.existsSync();
+
+    if (isDownloading || !hasAnyCacheFile) {
       return null; //Cache does not exist or is downloading
     }
-    final currentHeaders =
-        metadata.headers ?? CachedResponseHeaders.fromFile(cacheFile)!;
+
+    final currentHeaders = metadata.headers ??
+        CachedResponseHeaders.fromFile(files.complete) ??
+        CachedResponseHeaders.fromFile(files.partial);
+    if (currentHeaders == null) return null;
+
     if (!force && currentHeaders.shouldRevalidate() == false) return true;
 
-    // OFFLINE-FIRST: If revalidation is needed but a complete cache file
-    // exists locally, treat it as valid rather than making a network call.
-    // This ensures offline playback works for pre-cached content whose
+    // OFFLINE-FIRST: If revalidation is needed but a cache file (complete or
+    // partial) exists locally, treat it as valid rather than making a network
+    // call. This ensures offline playback works for pre-cached content whose
     // cache-control headers may have expired.
-    if (!force && cacheFile.existsSync()) {
-      final fileHeaders = CachedResponseHeaders.fromFile(cacheFile);
+    if (!force) {
+      final fileHeaders = CachedResponseHeaders.fromFile(files.complete) ??
+          CachedResponseHeaders.fromFile(files.partial);
       if (fileHeaders != null) {
         _setCachedResponseHeaders(fileHeaders);
         _calculateCacheProgress();
